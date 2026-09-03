@@ -8,18 +8,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case idle
         case listening
         case transcribing
+        case installing
     }
 
-    private let speechService = SpeechRecognizerService()
+    private let appleSpeechService = SpeechRecognizerService()
+    private let whisperRuntime = WhisperRuntimeManager()
+    private lazy var whisperService = WhisperMLXService(runtimeManager: whisperRuntime)
     private let textInserter = TextInserter()
     private var keyMonitor: PushToTalkMonitor?
+    private var permissionPollTimer: Timer?
+    private var state: RecognitionState = .idle
+    private var activeEngine: RecognitionEngine?
+
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
     private var localOnlyMenuItem: NSMenuItem!
+    private var whisperModelRootItem: NSMenuItem!
+    private var whisperInstallMenuItem: NSMenuItem!
+    private var dictationMenuItem: NSMenuItem!
+    private var engineMenuItems: [NSMenuItem] = []
     private var languageMenuItems: [NSMenuItem] = []
-    private var permissionPollTimer: Timer?
-    private var state: RecognitionState = .idle
-    private var permissionsWereRequested = false
+    private var whisperModelMenuItems: [NSMenuItem] = []
 
     private let languages: [(name: String, identifier: String)] = [
         ("简体中文", "zh-CN"),
@@ -28,9 +37,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ("日本語", "ja-JP")
     ]
 
+    private var selectedEngine: RecognitionEngine {
+        get {
+            guard let rawValue = UserDefaults.standard.string(forKey: "recognitionEngine"),
+                  let engine = RecognitionEngine(rawValue: rawValue) else {
+                return .apple
+            }
+            return engine
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "recognitionEngine") }
+    }
+
     private var selectedLocaleIdentifier: String {
         get { UserDefaults.standard.string(forKey: "recognitionLocale") ?? "zh-CN" }
         set { UserDefaults.standard.set(newValue, forKey: "recognitionLocale") }
+    }
+
+    private var selectedWhisperModel: WhisperModelOption {
+        get {
+            guard let rawValue = UserDefaults.standard.string(forKey: "whisperModel"),
+                  let model = WhisperModelOption(rawValue: rawValue) else {
+                return .small
+            }
+            return model
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "whisperModel") }
     }
 
     private var localRecognitionOnly: Bool {
@@ -53,7 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         permissionPollTimer?.invalidate()
         keyMonitor?.stop()
-        speechService.cancel()
+        appleSpeechService.cancel()
+        whisperService.cancel()
     }
 
     private func configureStatusItem() {
@@ -71,7 +103,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(shortcutItem)
         menu.addItem(.separator())
 
-        let languageItem = NSMenuItem(title: "识别语言", action: nil, keyEquivalent: "")
+        let engineRootItem = NSMenuItem(title: "识别引擎", action: nil, keyEquivalent: "")
+        let engineMenu = NSMenu()
+        for engine in RecognitionEngine.allCases {
+            let item = NSMenuItem(
+                title: engine.displayName,
+                action: #selector(selectEngine(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = engine.rawValue
+            engineMenu.addItem(item)
+            engineMenuItems.append(item)
+        }
+        engineRootItem.submenu = engineMenu
+        menu.addItem(engineRootItem)
+
+        whisperModelRootItem = NSMenuItem(title: "Whisper 模型", action: nil, keyEquivalent: "")
+        let whisperModelMenu = NSMenu()
+        for model in WhisperModelOption.allCases {
+            let item = NSMenuItem(
+                title: model.displayName,
+                action: #selector(selectWhisperModel(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = model.rawValue
+            whisperModelMenu.addItem(item)
+            whisperModelMenuItems.append(item)
+        }
+        whisperModelRootItem.submenu = whisperModelMenu
+        menu.addItem(whisperModelRootItem)
+
+        whisperInstallMenuItem = NSMenuItem(
+            title: "安装 Whisper MLX…",
+            action: #selector(installWhisperRuntime),
+            keyEquivalent: ""
+        )
+        whisperInstallMenuItem.target = self
+        menu.addItem(whisperInstallMenuItem)
+        menu.addItem(.separator())
+
+        let languageRootItem = NSMenuItem(title: "识别语言", action: nil, keyEquivalent: "")
         let languageMenu = NSMenu()
         for language in languages {
             let item = NSMenuItem(
@@ -84,11 +157,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             languageMenu.addItem(item)
             languageMenuItems.append(item)
         }
-        languageItem.submenu = languageMenu
-        menu.addItem(languageItem)
+        languageRootItem.submenu = languageMenu
+        menu.addItem(languageRootItem)
 
         localOnlyMenuItem = NSMenuItem(
-            title: "仅使用本地识别",
+            title: "Apple：仅使用本地识别",
             action: #selector(toggleLocalRecognition(_:)),
             keyEquivalent: ""
         )
@@ -112,13 +185,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         accessibilityItem.target = self
         menu.addItem(accessibilityItem)
 
-        let dictationItem = NSMenuItem(
-            title: "打开听写设置…",
+        dictationMenuItem = NSMenuItem(
+            title: "打开 Apple 听写设置…",
             action: #selector(openDictationSettings),
             keyEquivalent: ""
         )
-        dictationItem.target = self
-        menu.addItem(dictationItem)
+        dictationMenuItem.target = self
+        menu.addItem(dictationMenuItem)
 
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出 Transcribe", action: #selector(quit), keyEquivalent: "q")
@@ -130,29 +203,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestRequiredPermissions() {
-        guard !permissionsWereRequested else {
-            refreshPermissionStatus()
-            return
-        }
-        permissionsWereRequested = true
-
         let accessibilityOptions = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ] as CFDictionary
         AXIsProcessTrustedWithOptions(accessibilityOptions)
 
-        SFSpeechRecognizer.requestAuthorization { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.refreshPermissionStatus()
+        if selectedEngine == .apple,
+           SFSpeechRecognizer.authorizationStatus() == .notDetermined {
+            SFSpeechRecognizer.requestAuthorization { [weak self] _ in
+                DispatchQueue.main.async { self?.refreshPermissionStatus() }
             }
         }
 
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
-                DispatchQueue.main.async {
-                    self?.refreshPermissionStatus()
-                }
+                DispatchQueue.main.async { self?.refreshPermissionStatus() }
             }
         default:
             refreshPermissionStatus()
@@ -167,11 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onRelease: { [weak self] in self?.finishListening() }
         )
 
-        if monitor.start() {
-            keyMonitor = monitor
-        } else {
-            keyMonitor = nil
-        }
+        keyMonitor = monitor.start() ? monitor : nil
         refreshPermissionStatus()
     }
 
@@ -180,61 +242,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard requiredPermissionsAreGranted else {
             requestRequiredPermissions()
+            startPermissionPolling()
             NSSound.beep()
             return
         }
 
         do {
-            try speechService.start(
-                localeIdentifier: selectedLocaleIdentifier,
-                onDeviceOnly: localRecognitionOnly
-            )
+            switch selectedEngine {
+            case .apple:
+                try appleSpeechService.start(
+                    localeIdentifier: selectedLocaleIdentifier,
+                    onDeviceOnly: localRecognitionOnly
+                )
+            case .whisperMLX:
+                guard whisperRuntime.isInstalled else {
+                    showWhisperInstallPrompt()
+                    return
+                }
+                try whisperService.start()
+            }
+
+            activeEngine = selectedEngine
             state = .listening
-            setStatus(title: "正在听…", symbol: "mic.fill")
+            setStatus(title: "正在听… · \(selectedEngine.displayName)", symbol: "mic.fill")
         } catch {
+            activeEngine = nil
             state = .idle
             showError(error.localizedDescription)
         }
     }
 
     private func finishListening() {
-        guard state == .listening else { return }
+        guard state == .listening, let activeEngine else { return }
 
         state = .transcribing
-        setStatus(title: "正在转写…", symbol: "ellipsis.bubble")
+        setStatus(title: "正在转写… · \(activeEngine.displayName)", symbol: "ellipsis.bubble")
 
-        speechService.finish { [weak self] result in
-            guard let self else { return }
-            self.state = .idle
+        let completion: (Result<String, Error>) -> Void = { [weak self] result in
+            self?.handleTranscriptionResult(result, engine: activeEngine)
+        }
 
-            switch result {
-            case .success(let text):
-                if text.isEmpty {
-                    self.setStatus(title: "没有识别到语音", symbol: "mic")
-                } else {
-                    self.textInserter.insert(text)
-                    self.setStatus(title: "就绪", symbol: "mic")
-                }
-            case .failure(let error):
-                let isDictationDisabled: Bool
-                if let serviceError = error as? SpeechRecognizerService.ServiceError,
-                   case .dictationDisabled = serviceError {
-                    isDictationDisabled = true
-                } else {
-                    isDictationDisabled = false
-                }
-                self.showError(
-                    error.localizedDescription,
-                    offerDictationSettings: isDictationDisabled
-                )
+        switch activeEngine {
+        case .apple:
+            appleSpeechService.finish(completion: completion)
+        case .whisperMLX:
+            whisperService.finish(
+                localeIdentifier: selectedLocaleIdentifier,
+                model: selectedWhisperModel,
+                completion: completion
+            )
+        }
+    }
+
+    private func handleTranscriptionResult(
+        _ result: Result<String, Error>,
+        engine: RecognitionEngine
+    ) {
+        state = .idle
+        activeEngine = nil
+
+        switch result {
+        case .success(let text):
+            if text.isEmpty {
+                setStatus(title: "没有识别到语音 · \(engine.displayName)", symbol: "mic")
+            } else {
+                textInserter.insert(text)
+                setReadyStatus()
             }
+        case .failure(let error):
+            let isDictationDisabled: Bool
+            if let serviceError = error as? SpeechRecognizerService.ServiceError,
+               case .dictationDisabled = serviceError {
+                isDictationDisabled = true
+            } else {
+                isDictationDisabled = false
+            }
+            showError(error.localizedDescription, offerDictationSettings: isDictationDisabled)
         }
     }
 
     private var requiredPermissionsAreGranted: Bool {
-        AXIsProcessTrusted()
-            && SFSpeechRecognizer.authorizationStatus() == .authorized
-            && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        guard AXIsProcessTrusted(),
+              AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            return false
+        }
+        return selectedEngine != .apple
+            || SFSpeechRecognizer.authorizationStatus() == .authorized
     }
 
     private func refreshPermissionStatus() {
@@ -243,16 +336,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if requiredPermissionsAreGranted && keyMonitor != nil {
             permissionPollTimer?.invalidate()
             permissionPollTimer = nil
-            setStatus(title: "就绪", symbol: "mic")
+            setReadyStatus()
+            updateMenuSelections()
             return
         }
 
         var missing: [String] = []
         if !AXIsProcessTrusted() { missing.append("辅助功能") }
-        if SFSpeechRecognizer.authorizationStatus() != .authorized { missing.append("语音识别") }
         if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized { missing.append("麦克风") }
+        if selectedEngine == .apple,
+           SFSpeechRecognizer.authorizationStatus() != .authorized {
+            missing.append("语音识别")
+        }
 
-        setStatus(title: "需要权限：\(missing.joined(separator: "、"))", symbol: "mic.slash")
+        let title = missing.isEmpty ? "正在启用快捷键…" : "需要权限：\(missing.joined(separator: "、"))"
+        setStatus(title: title, symbol: "mic.slash")
     }
 
     private func startPermissionPolling() {
@@ -270,34 +368,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func setReadyStatus() {
+        if selectedEngine == .whisperMLX && !whisperRuntime.isInstalled {
+            setStatus(title: "Whisper MLX 尚未安装", symbol: "arrow.down.circle")
+        } else {
+            setStatus(title: "就绪 · \(selectedEngine.displayName)", symbol: "mic")
+        }
+    }
+
     private func setStatus(title: String, symbol: String) {
         statusMenuItem.title = title
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        statusItem.button?.contentTintColor = symbol == "mic.fill" ? .systemRed : .labelColor
         statusItem.button?.toolTip = "Transcribe：\(title)"
     }
 
     private func showError(_ message: String, offerDictationSettings: Bool = false) {
-        setStatus(title: "出错：\(message)", symbol: "exclamationmark.triangle")
+        let lastLine = message.split(whereSeparator: \.isNewline).last.map(String.init) ?? message
+        let compactMessage = String(lastLine.prefix(120))
+        setStatus(title: "出错：\(compactMessage)", symbol: "exclamationmark.triangle")
         NSSound.beep()
 
-        guard offerDictationSettings else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "需要打开 macOS 听写"
+        alert.messageText = offerDictationSettings ? "需要打开 macOS 听写" : "转写失败"
         alert.informativeText = message
-        alert.addButton(withTitle: "打开听写设置")
-        alert.addButton(withTitle: "稍后")
+        alert.addButton(withTitle: offerDictationSettings ? "打开听写设置" : "好")
+        if offerDictationSettings {
+            alert.addButton(withTitle: "稍后")
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+        if alert.runModal() == .alertFirstButtonReturn && offerDictationSettings {
             openDictationSettings()
         }
     }
 
+    private func showWhisperInstallPrompt() {
+        guard !whisperRuntime.isInstalling else {
+            setStatus(title: "正在安装 Whisper MLX…", symbol: "arrow.down.circle")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "安装 Whisper MLX？"
+        alert.informativeText = "应用将使用 uv 安装 mlx-whisper 0.4.3，运行环境约占 1 GB。模型会在第一次转写时下载；当前选择的 \(selectedWhisperModel.displayName) 将保存在本机，之后可离线使用。"
+        alert.addButton(withTitle: "安装")
+        alert.addButton(withTitle: "取消")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            installWhisperRuntime()
+        }
+    }
+
     private func updateMenuSelections() {
+        for item in engineMenuItems {
+            item.state = (item.representedObject as? String == selectedEngine.rawValue) ? .on : .off
+        }
         for item in languageMenuItems {
             item.state = (item.representedObject as? String == selectedLocaleIdentifier) ? .on : .off
         }
+        for item in whisperModelMenuItems {
+            item.state = (item.representedObject as? String == selectedWhisperModel.rawValue) ? .on : .off
+        }
+
+        let whisperSelected = selectedEngine == .whisperMLX
+        whisperModelRootItem.isEnabled = whisperSelected
+        whisperInstallMenuItem.isEnabled = !whisperRuntime.isInstalling
+        whisperInstallMenuItem.title = whisperRuntime.isInstalled
+            ? "更新 Whisper MLX…"
+            : "安装 Whisper MLX…"
+        localOnlyMenuItem.isEnabled = !whisperSelected
         localOnlyMenuItem.state = localRecognitionOnly ? .on : .off
+        dictationMenuItem.isEnabled = !whisperSelected
+    }
+
+    @objc private func selectEngine(_ sender: NSMenuItem) {
+        guard state == .idle,
+              let rawValue = sender.representedObject as? String,
+              let engine = RecognitionEngine(rawValue: rawValue) else { return }
+
+        selectedEngine = engine
+        updateMenuSelections()
+        requestRequiredPermissions()
+        refreshPermissionStatus()
+        startPermissionPolling()
+
+        if engine == .whisperMLX && !whisperRuntime.isInstalled {
+            DispatchQueue.main.async { [weak self] in self?.showWhisperInstallPrompt() }
+        }
     }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
@@ -306,13 +465,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuSelections()
     }
 
+    @objc private func selectWhisperModel(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let model = WhisperModelOption(rawValue: rawValue) else { return }
+        selectedWhisperModel = model
+        updateMenuSelections()
+    }
+
     @objc private func toggleLocalRecognition(_ sender: NSMenuItem) {
         localRecognitionOnly.toggle()
         updateMenuSelections()
     }
 
+    @objc private func installWhisperRuntime() {
+        guard state == .idle else { return }
+        state = .installing
+        setStatus(title: "正在安装 Whisper MLX…", symbol: "arrow.down.circle")
+        updateMenuSelections()
+
+        whisperRuntime.install { [weak self] result in
+            guard let self else { return }
+            self.state = .idle
+            self.updateMenuSelections()
+
+            switch result {
+            case .success:
+                self.setReadyStatus()
+                let alert = NSAlert()
+                alert.messageText = "Whisper MLX 安装完成"
+                alert.informativeText = "第一次使用 \(self.selectedWhisperModel.displayName) 时会下载模型，下载完成后即可离线转写。"
+                alert.addButton(withTitle: "好")
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                alert.runModal()
+            case .failure(let error):
+                self.showError(error.localizedDescription)
+            }
+        }
+    }
+
     @objc private func checkPermissions() {
-        permissionsWereRequested = false
         requestRequiredPermissions()
         installPushToTalkMonitor()
         startPermissionPolling()
