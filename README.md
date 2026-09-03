@@ -39,9 +39,27 @@ make run
 点击菜单栏麦克风图标可以切换识别引擎、语言和模型：
 
 - **Apple 语音识别**：默认要求在设备端运行。关闭“Apple：仅使用本地识别”后，系统可能使用 Apple 的在线语音识别服务。
-- **Whisper MLX**：选择后按提示安装约 1 GB 的运行环境。默认使用 `mlx-community/whisper-small-mlx`（约 481 MB），也可以选择 `mlx-community/whisper-large-v3-turbo`（约 1.61 GB）。模型在第一次转写时下载到 `~/Library/Application Support/Transcribe/models`，后续可以离线使用。
+- **Whisper MLX**：选择后先设置存储位置，再安装约 1 GB 的运行环境。运行环境和模型都会保存在所选目录中。
 
-Whisper MLX 运行环境位于 `~/Library/Application Support/Transcribe/whisper-runtime`。点击菜单中的“更新 Whisper MLX…”可以更新或修复运行环境。
+Whisper 模型必须先从菜单明确下载，下载完成前应用不会开始录音或转写。模型菜单会显示每个模型的下载状态：
+
+| 模型 | 下载大小 | 适用情况 |
+| --- | ---: | --- |
+| Tiny | 74.4 MB | 速度最快、资源占用最低 |
+| Base | 144 MB | 快速、轻量 |
+| Small | 481 MB | 速度与准确率均衡，默认推荐 |
+| Medium | 1.52 GB | 更高准确率 |
+| Large V2 | 3.08 GB | 旧版高精度模型 |
+| Large V3 Turbo | 1.61 GB | 兼顾速度与高准确率 |
+| Large V3 | 3.08 GB | 最高准确率、资源占用最大 |
+
+所选存储目录包含：
+
+- `whisper-runtime`：MLX Python 运行环境
+- `uv-python` 和 `uv-cache`：由 uv 管理的 Python 与安装缓存
+- `models`：已下载的 Whisper 模型
+
+可以随时从菜单选择“设置 Whisper 存储位置…”。更改位置不会移动旧目录中的文件；应用只使用新位置中已经安装的运行环境和已经完整下载的模型。
 
 ## 开发命令
 
@@ -55,5 +73,6 @@ make run          # 生成并启动 .app
 
 - 密码框等安全输入区域不接受模拟输入。
 - 某些远程桌面、虚拟机或游戏可能拦截全局快捷键。
-- Whisper 模型第一次使用时需要联网下载；模型越大，首次转写等待时间越长。
+- Whisper 运行环境和模型下载时需要联网；模型越大，下载时间越长。
+- 如果存储位置位于外置硬盘，使用 Whisper 前需要确保硬盘已连接。
 - 应用采用临时签名；每次删除后重新构建，macOS 可能再次请求权限。
