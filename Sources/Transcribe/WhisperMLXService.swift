@@ -4,6 +4,7 @@ import Foundation
 final class WhisperMLXService {
     enum ServiceError: LocalizedError {
         case runtimeNotInstalled
+        case modelNotDownloaded(String)
         case helperMissing
         case couldNotStartAudio(String)
         case transcriptionFailed(String)
@@ -13,6 +14,8 @@ final class WhisperMLXService {
             switch self {
             case .runtimeNotInstalled:
                 return "Whisper MLX 尚未安装，请从菜单选择“安装 / 更新 Whisper MLX…”"
+            case .modelNotDownloaded(let modelName):
+                return "\(modelName) 尚未下载，请先从菜单下载模型"
             case .helperMissing:
                 return "应用包中缺少 Whisper 转写脚本"
             case .couldNotStartAudio(let detail):
@@ -89,6 +92,12 @@ final class WhisperMLXService {
             return
         }
 
+        guard runtimeManager.isModelDownloaded(model) else {
+            try? FileManager.default.removeItem(at: recordingURL)
+            completion(.failure(ServiceError.modelNotDownloaded(model.displayName)))
+            return
+        }
+
         guard let helperURL = Bundle.main.url(
             forResource: "whisper_transcribe",
             withExtension: "py"
@@ -142,11 +151,6 @@ final class WhisperMLXService {
         language: String,
         model: WhisperModelOption
     ) throws -> String {
-        try FileManager.default.createDirectory(
-            at: runtimeManager.modelCacheURL,
-            withIntermediateDirectories: true
-        )
-
         let process = Process()
         let outputPipe = Pipe()
         let errorURL = FileManager.default.temporaryDirectory
@@ -164,7 +168,7 @@ final class WhisperMLXService {
         process.arguments = [
             helperURL.path,
             "--audio", audioURL.path,
-            "--model", model.repositoryIdentifier,
+            "--model", runtimeManager.modelURL(for: model).path,
             "--language", language
         ]
         var environment = ProcessInfo.processInfo.environment

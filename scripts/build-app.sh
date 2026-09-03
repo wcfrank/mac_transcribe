@@ -20,6 +20,7 @@ mkdir -p "$STAGING_ROOT/Contents/Resources"
 cp "$BIN_PATH/Transcribe" "$STAGING_ROOT/Contents/MacOS/Transcribe"
 cp "$PROJECT_ROOT/Resources/Info.plist" "$STAGING_ROOT/Contents/Info.plist"
 cp "$PROJECT_ROOT/Resources/whisper_transcribe.py" "$STAGING_ROOT/Contents/Resources/whisper_transcribe.py"
+cp "$PROJECT_ROOT/Resources/whisper_download.py" "$STAGING_ROOT/Contents/Resources/whisper_download.py"
 
 codesign \
     --force \

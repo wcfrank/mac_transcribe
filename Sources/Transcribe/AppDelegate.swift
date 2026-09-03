@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case listening
         case transcribing
         case installing
+        case downloading
     }
 
     private let appleSpeechService = SpeechRecognizerService()
@@ -25,6 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var localOnlyMenuItem: NSMenuItem!
     private var whisperModelRootItem: NSMenuItem!
     private var whisperInstallMenuItem: NSMenuItem!
+    private var whisperDownloadMenuItem: NSMenuItem!
+    private var whisperStorageMenuItem: NSMenuItem!
+    private var whisperStorageInfoMenuItem: NSMenuItem!
+    private var whisperRevealStorageMenuItem: NSMenuItem!
     private var dictationMenuItem: NSMenuItem!
     private var engineMenuItems: [NSMenuItem] = []
     private var languageMenuItems: [NSMenuItem] = []
@@ -135,6 +140,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         whisperModelRootItem.submenu = whisperModelMenu
         menu.addItem(whisperModelRootItem)
 
+        whisperDownloadMenuItem = NSMenuItem(
+            title: "下载所选 Whisper 模型…",
+            action: #selector(downloadSelectedWhisperModel),
+            keyEquivalent: ""
+        )
+        whisperDownloadMenuItem.target = self
+        menu.addItem(whisperDownloadMenuItem)
+
         whisperInstallMenuItem = NSMenuItem(
             title: "安装 Whisper MLX…",
             action: #selector(installWhisperRuntime),
@@ -142,6 +155,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         whisperInstallMenuItem.target = self
         menu.addItem(whisperInstallMenuItem)
+
+        whisperStorageMenuItem = NSMenuItem(
+            title: "设置 Whisper 存储位置…",
+            action: #selector(selectWhisperStorageLocation),
+            keyEquivalent: ""
+        )
+        whisperStorageMenuItem.target = self
+        menu.addItem(whisperStorageMenuItem)
+
+        whisperStorageInfoMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        whisperStorageInfoMenuItem.isEnabled = false
+        menu.addItem(whisperStorageInfoMenuItem)
+
+        whisperRevealStorageMenuItem = NSMenuItem(
+            title: "在 Finder 中显示 Whisper 文件",
+            action: #selector(revealWhisperStorage),
+            keyEquivalent: ""
+        )
+        whisperRevealStorageMenuItem.target = self
+        menu.addItem(whisperRevealStorageMenuItem)
         menu.addItem(.separator())
 
         let languageRootItem = NSMenuItem(title: "识别语言", action: nil, keyEquivalent: "")
@@ -255,8 +288,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     onDeviceOnly: localRecognitionOnly
                 )
             case .whisperMLX:
+                guard whisperRuntime.hasConfiguredStorageLocation,
+                      whisperRuntime.isStorageAvailable else {
+                    showWhisperInstallPrompt()
+                    return
+                }
                 guard whisperRuntime.isInstalled else {
                     showWhisperInstallPrompt()
+                    return
+                }
+                guard whisperRuntime.isModelDownloaded(selectedWhisperModel) else {
+                    showWhisperModelDownloadPrompt()
                     return
                 }
                 try whisperService.start()
@@ -369,8 +411,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setReadyStatus() {
-        if selectedEngine == .whisperMLX && !whisperRuntime.isInstalled {
+        guard selectedEngine == .whisperMLX else {
+            setStatus(title: "就绪 · \(selectedEngine.displayName)", symbol: "mic")
+            return
+        }
+
+        if !whisperRuntime.hasConfiguredStorageLocation {
+            setStatus(title: "请设置 Whisper 存储位置", symbol: "questionmark.folder")
+        } else if !whisperRuntime.isStorageAvailable {
+            setStatus(title: "Whisper 存储位置不可用", symbol: "externaldrive.badge.exclamationmark")
+        } else if !whisperRuntime.isInstalled {
             setStatus(title: "Whisper MLX 尚未安装", symbol: "arrow.down.circle")
+        } else if !whisperRuntime.isModelDownloaded(selectedWhisperModel) {
+            setStatus(title: "请下载 \(selectedWhisperModel.displayName)", symbol: "arrow.down.circle")
         } else {
             setStatus(title: "就绪 · \(selectedEngine.displayName)", symbol: "mic")
         }
@@ -391,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = offerDictationSettings ? "需要打开 macOS 听写" : "转写失败"
+        alert.messageText = offerDictationSettings ? "需要打开 macOS 听写" : "操作失败"
         alert.informativeText = message
         alert.addButton(withTitle: offerDictationSettings ? "打开听写设置" : "好")
         if offerDictationSettings {
@@ -404,20 +457,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showWhisperInstallPrompt() {
-        guard !whisperRuntime.isInstalling else {
-            setStatus(title: "正在安装 Whisper MLX…", symbol: "arrow.down.circle")
+        guard !whisperRuntime.isBusy else {
+            setStatus(title: "Whisper MLX 正在执行任务…", symbol: "arrow.down.circle")
+            return
+        }
+        guard ensureWhisperStorageConfigured() else { return }
+        if whisperRuntime.isInstalled {
+            if whisperRuntime.isModelDownloaded(selectedWhisperModel) {
+                setReadyStatus()
+            } else {
+                showWhisperModelDownloadPrompt()
+            }
             return
         }
 
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "安装 Whisper MLX？"
-        alert.informativeText = "应用将使用 uv 安装 mlx-whisper 0.4.3，运行环境约占 1 GB。模型会在第一次转写时下载；当前选择的 \(selectedWhisperModel.displayName) 将保存在本机，之后可离线使用。"
+        alert.informativeText = "应用将使用 uv 安装 mlx-whisper 0.4.3，运行环境约占 1 GB。\n\n存储位置：\(whisperRuntime.displayStoragePath)\n\n模型不会自动下载；安装运行环境后，你可以单独下载需要的模型。"
         alert.addButton(withTitle: "安装")
         alert.addButton(withTitle: "取消")
         NSApplication.shared.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             installWhisperRuntime()
+        }
+    }
+
+    private func showWhisperModelDownloadPrompt() {
+        guard !whisperRuntime.isBusy else { return }
+        guard ensureWhisperStorageConfigured() else { return }
+        guard whisperRuntime.isInstalled else {
+            showWhisperInstallPrompt()
+            return
+        }
+
+        let alreadyDownloaded = whisperRuntime.isModelDownloaded(selectedWhisperModel)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = alreadyDownloaded ? "重新下载模型？" : "需要先下载模型"
+        alert.informativeText = "模型：\(selectedWhisperModel.displayName)\n存储位置：\(whisperRuntime.displayStoragePath)\n\n下载完成前不能使用这个模型进行转写。"
+        alert.addButton(withTitle: alreadyDownloaded ? "重新下载" : "下载")
+        alert.addButton(withTitle: "取消")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            startWhisperModelDownload()
+        }
+    }
+
+    private func ensureWhisperStorageConfigured() -> Bool {
+        if whisperRuntime.hasConfiguredStorageLocation {
+            guard !whisperRuntime.isStorageAvailable else { return true }
+
+            let unavailableAlert = NSAlert()
+            unavailableAlert.alertStyle = .warning
+            unavailableAlert.messageText = "Whisper 存储位置不可用"
+            unavailableAlert.informativeText = "请重新连接对应磁盘，或选择新的存储位置：\n\(whisperRuntime.storageURL.path)"
+            unavailableAlert.addButton(withTitle: "选择新位置…")
+            unavailableAlert.addButton(withTitle: "取消")
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            return unavailableAlert.runModal() == .alertFirstButtonReturn
+                && chooseWhisperStorageLocation()
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "选择 Whisper 存储位置"
+        alert.informativeText = "运行环境、uv 缓存、Python 和所有模型都会保存在所选目录中。你也可以使用默认位置：\n\(whisperRuntime.defaultStorageURL.path)"
+        alert.addButton(withTitle: "选择位置…")
+        alert.addButton(withTitle: "使用默认位置")
+        alert.addButton(withTitle: "取消")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return chooseWhisperStorageLocation()
+        case .alertSecondButtonReturn:
+            do {
+                try whisperRuntime.configureStorage(at: whisperRuntime.defaultStorageURL)
+                updateMenuSelections()
+                setReadyStatus()
+                return true
+            } catch {
+                showError(error.localizedDescription)
+                return false
+            }
+        default:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func chooseWhisperStorageLocation() -> Bool {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Whisper 存储位置"
+        panel.message = "Transcribe 会在所选目录中创建 whisper-runtime、uv-python、uv-cache 和 models。"
+        panel.prompt = "使用此位置"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        if FileManager.default.fileExists(atPath: whisperRuntime.storageURL.path) {
+            panel.directoryURL = whisperRuntime.storageURL
+        }
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+
+        do {
+            try whisperRuntime.configureStorage(at: url)
+            updateMenuSelections()
+            setReadyStatus()
+            return true
+        } catch {
+            showError(error.localizedDescription)
+            return false
         }
     }
 
@@ -429,15 +582,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.state = (item.representedObject as? String == selectedLocaleIdentifier) ? .on : .off
         }
         for item in whisperModelMenuItems {
-            item.state = (item.representedObject as? String == selectedWhisperModel.rawValue) ? .on : .off
+            guard let rawValue = item.representedObject as? String,
+                  let model = WhisperModelOption(rawValue: rawValue) else { continue }
+            item.state = model == selectedWhisperModel ? .on : .off
+            item.title = model.displayName
+                + (whisperRuntime.isModelDownloaded(model) ? " · 已下载" : " · 未下载")
         }
 
         let whisperSelected = selectedEngine == .whisperMLX
-        whisperModelRootItem.isEnabled = whisperSelected
-        whisperInstallMenuItem.isEnabled = !whisperRuntime.isInstalling
+        let canModifyWhisper = state == .idle && !whisperRuntime.isBusy
+        whisperModelRootItem.isEnabled = whisperSelected && canModifyWhisper
+        whisperInstallMenuItem.isEnabled = whisperSelected && canModifyWhisper
         whisperInstallMenuItem.title = whisperRuntime.isInstalled
             ? "更新 Whisper MLX…"
             : "安装 Whisper MLX…"
+        whisperDownloadMenuItem.isEnabled = whisperSelected
+            && canModifyWhisper
+            && whisperRuntime.isInstalled
+        whisperDownloadMenuItem.title = whisperRuntime.isModelDownloaded(selectedWhisperModel)
+            ? "重新下载 \(selectedWhisperModel.displayName)…"
+            : "下载 \(selectedWhisperModel.displayName)…"
+        whisperStorageMenuItem.isEnabled = canModifyWhisper
+        whisperStorageInfoMenuItem.title = "存储位置：\(whisperRuntime.displayStoragePath)"
+        whisperRevealStorageMenuItem.isEnabled = whisperRuntime.isStorageAvailable
         localOnlyMenuItem.isEnabled = !whisperSelected
         localOnlyMenuItem.state = localRecognitionOnly ? .on : .off
         dictationMenuItem.isEnabled = !whisperSelected
@@ -454,8 +621,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshPermissionStatus()
         startPermissionPolling()
 
-        if engine == .whisperMLX && !whisperRuntime.isInstalled {
-            DispatchQueue.main.async { [weak self] in self?.showWhisperInstallPrompt() }
+        if engine == .whisperMLX {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if !self.whisperRuntime.hasConfiguredStorageLocation
+                    || !self.whisperRuntime.isStorageAvailable
+                    || !self.whisperRuntime.isInstalled {
+                    self.showWhisperInstallPrompt()
+                } else if !self.whisperRuntime.isModelDownloaded(self.selectedWhisperModel) {
+                    self.showWhisperModelDownloadPrompt()
+                }
+            }
         }
     }
 
@@ -466,10 +642,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func selectWhisperModel(_ sender: NSMenuItem) {
-        guard let rawValue = sender.representedObject as? String,
+        guard state == .idle,
+              let rawValue = sender.representedObject as? String,
               let model = WhisperModelOption(rawValue: rawValue) else { return }
         selectedWhisperModel = model
         updateMenuSelections()
+        setReadyStatus()
+
+        if selectedEngine == .whisperMLX,
+           whisperRuntime.isInstalled,
+           !whisperRuntime.isModelDownloaded(model) {
+            DispatchQueue.main.async { [weak self] in self?.showWhisperModelDownloadPrompt() }
+        }
     }
 
     @objc private func toggleLocalRecognition(_ sender: NSMenuItem) {
@@ -479,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func installWhisperRuntime() {
         guard state == .idle else { return }
+        guard ensureWhisperStorageConfigured() else { return }
         state = .installing
         setStatus(title: "正在安装 Whisper MLX…", symbol: "arrow.down.circle")
         updateMenuSelections()
@@ -493,7 +678,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.setReadyStatus()
                 let alert = NSAlert()
                 alert.messageText = "Whisper MLX 安装完成"
-                alert.informativeText = "第一次使用 \(self.selectedWhisperModel.displayName) 时会下载模型，下载完成后即可离线转写。"
+                alert.informativeText = "运行环境已安装到：\n\(self.whisperRuntime.displayStoragePath)\n\n还需要下载模型才能使用 Whisper MLX。"
+                alert.addButton(withTitle: "下载 \(self.selectedWhisperModel.displayName)")
+                alert.addButton(withTitle: "稍后")
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn {
+                    self.startWhisperModelDownload()
+                }
+            case .failure(let error):
+                self.showError(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func downloadSelectedWhisperModel() {
+        guard state == .idle else { return }
+        showWhisperModelDownloadPrompt()
+    }
+
+    private func startWhisperModelDownload() {
+        guard state == .idle,
+              whisperRuntime.isStorageAvailable,
+              whisperRuntime.isInstalled else { return }
+        let model = selectedWhisperModel
+        state = .downloading
+        setStatus(title: "正在下载 \(model.displayName)…", symbol: "arrow.down.circle")
+        updateMenuSelections()
+
+        whisperRuntime.download(model: model) { [weak self] result in
+            guard let self else { return }
+            self.state = .idle
+            self.updateMenuSelections()
+
+            switch result {
+            case .success:
+                self.setReadyStatus()
+                let alert = NSAlert()
+                alert.messageText = "Whisper 模型下载完成"
+                alert.informativeText = "\(model.displayName) 已保存到：\n\(self.whisperRuntime.modelURL(for: model).path)\n\n现在可以按住右侧 Option 开始转写。"
                 alert.addButton(withTitle: "好")
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 alert.runModal()
@@ -501,6 +723,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.showError(error.localizedDescription)
             }
         }
+    }
+
+    @objc private func selectWhisperStorageLocation() {
+        guard state == .idle else { return }
+        guard chooseWhisperStorageLocation() else { return }
+        if selectedEngine == .whisperMLX && !whisperRuntime.isInstalled {
+            DispatchQueue.main.async { [weak self] in self?.showWhisperInstallPrompt() }
+        }
+    }
+
+    @objc private func revealWhisperStorage() {
+        guard whisperRuntime.isStorageAvailable else {
+            showError("Whisper 存储位置不可用：\(whisperRuntime.storageURL.path)")
+            return
+        }
+        NSWorkspace.shared.open(whisperRuntime.storageURL)
     }
 
     @objc private func checkPermissions() {
